@@ -117,6 +117,7 @@ OUTPUT:
    -f, -field string   field to display in output (ip,port,host) (default "ip:port")
    -j, -json           write output in JSONL(ines) format
    -r, -raw            write raw output as received by the remote api
+   -m, -merge          merge results from all engines keeping per-engine sources and confidence (not combinable with -raw)
    -l, -limit int      limit the number of results to return (default 100)
    -nc, -no-color      disable colors in output
 
@@ -422,6 +423,45 @@ echo 8.8.8.8/20 | uncover -e driftnet
 8.8.8.8:853
 ...
 ```
+
+### Merged output with engine sources (`-m, -merge`)
+
+By default uncover streams results and deduplicates them by the printed line, so when several engines return the same asset you cannot tell which engines reported it. `-m, -merge` changes this: all engines are queried as usual, then results are merged by canonical asset identity and printed once per asset with the list of engines that returned it and a confidence score (the number of those engines). Assets are ordered by confidence, not by return order.
+
+```console
+uncover -q jira -e shodan,censys,fofa -m -silent
+
+1.2.3.4:443	sources=censys,fofa,shodan	confidence=3
+5.6.7.8:8443	sources=fofa,shodan	confidence=2
+9.10.11.12:80	sources=shodan	confidence=1
+```
+
+With `-j` the sources stay structured:
+
+```json
+{"asset":"1.2.3.4:443","ip":"1.2.3.4","port":443,"sources":["censys","fofa","shodan"],"confidence":3,"timestamp":1795300458}
+```
+
+Behavior and rules:
+
+- **Identity normalization** (defined once in `sources/normalize.go`): hostnames are lowercased, scheme prefixes (`https://...`) and paths are stripped, and default scheme ports are canonicalized — so `Example.com:443`, `https://example.com/` and `example.com` with port 443 merge into one asset. The original per-engine forms are kept in the merged record; only the identity key is normalized.
+- **Engine status** is reported on stderr after the run, distinguishing an engine that returned nothing from one that failed:
+  ```
+  [merge] engine shodan: 12 results
+  [merge] engine censys: no results
+  [merge] engine fofa: error: upstream timeout
+  [merge] engine quake: skipped 2 malformed results
+  ```
+- **Failure handling**: one failing engine never blocks the others. If *every* engine fails, uncover exits with an explicit `all engines failed` error instead of writing an empty list. Malformed results (no usable IP/host/URL) are skipped and counted per engine.
+- **Output is deterministic**: identical inputs produce byte-identical output across runs, independent of engine completion order. With `-o`, the output file is written atomically (temp file + rename) at the end of the run, so a failed run never leaves a half-written file.
+- **Comparing runs**: because sources survive to the output, diffing two merged outputs shows provenance changes directly — an asset gaining a source means a new engine started covering it, a lost source means an engine dropped it.
+
+Known limitations:
+
+- `-m` cannot be combined with `-r, -raw` (raw passthrough has no normalized identity to merge on).
+- Assets are identified by `ip:port`, or by `host:port` when no IP is reported. An asset reported by one engine as `1.2.3.4:443` and by another only as `host.example` cannot be matched without DNS resolution and stays as two entries.
+- Merge mode buffers all results in memory before printing (roughly one result struct per engine result; ~1 MB per 3000 results in benchmarks) and adds one mutex-protected map update per result — about 2x the CPU of the default streaming path at equal input size, with no additional network synchronization.
+- Old output files produced without `-m` contain no source information and cannot be enriched retroactively; they remain valid asset lists. Re-run the same query with `-m` to obtain provenance.
 
 ### Field Format
 

@@ -125,6 +125,13 @@ func New(opts *Options) (*Service, error) {
 }
 
 func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
+	return s.execute(ctx, nil)
+}
+
+// execute is the single fan-out path. When observer is non-nil it receives
+// per-engine failures and every streamed result; the default Execute passes
+// nil and behaves exactly as before.
+func (s *Service) execute(ctx context.Context, observer sources.ResultObserver) (<-chan sources.Result, error) {
 	// unlikely but as a precaution to handle random panics check all types
 	if err := s.nilCheck(); err != nil {
 		return nil, err
@@ -145,6 +152,9 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 			keys := s.Provider.GetKeys()
 			if keys.Empty() && agent.Name() != "shodan-idb" && agent.Name() != "scanmalware" && agent.Name() != "subdomaincenter" {
 				gologger.Error().Msgf(agent.Name(), "agent given but keys not found")
+				if observer != nil {
+					observer.NoteEngineError(agent.Name(), errorutil.NewWithTag("uncover", "agent %s given but keys not found", agent.Name()))
+				}
 				continue agentLabel
 			}
 			ch, err := agent.Query(ctx, s.Session, &sources.Query{
@@ -153,7 +163,13 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 			})
 			if err != nil {
 				gologger.Error().Msgf("%s\n", err)
+				if observer != nil {
+					observer.NoteEngineError(agent.Name(), err)
+				}
 				continue agentLabel
+			}
+			if observer != nil {
+				observer.NoteEngineStart(agent.Name())
 			}
 			wg.Add(1)
 			go func(source, relay chan sources.Result, ctx context.Context) {
@@ -166,6 +182,9 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 						res.Timestamp = time.Now().Unix()
 						if !ok {
 							return
+						}
+						if observer != nil {
+							observer.Add(res)
 						}
 						select {
 						case <-ctx.Done():
@@ -185,6 +204,28 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 	}(wg, megaChan)
 
 	return megaChan, nil
+}
+
+// ExecuteMerged runs all engines, merges their results by canonical asset
+// identity and keeps per-engine provenance. It returns an explicit error
+// when every engine failed, so callers never mistake a total failure for an
+// empty result set. A single failing engine never blocks the others.
+func (s *Service) ExecuteMerged(ctx context.Context) (*sources.MergeResult, error) {
+	merger := sources.NewMerger()
+	ch, err := s.execute(ctx, merger)
+	if err != nil {
+		return nil, err
+	}
+	// Drain the relay channel: the merger already observed every result
+	// inside the fan-out, and draining keeps the relay goroutines
+	// unblocked until they finish.
+	for range ch { //nolint
+	}
+	merged := merger.Finalize()
+	if merged.AllEnginesFailed() {
+		return merged, errorutil.NewWithTag("uncover", "all engines failed: %s", merged.FailureSummary())
+	}
+	return merged, nil
 }
 
 // ExecuteWithWriters writes output to writer along with stdout
