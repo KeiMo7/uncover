@@ -2,11 +2,11 @@ package runner
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
-
-	"errors"
 
 	awesomesearchqueries "github.com/projectdiscovery/awesome-search-queries"
 	"github.com/projectdiscovery/goflags"
@@ -46,6 +46,9 @@ type Options struct {
 	RateLimitMinute      int
 	Retries              int
 	Proxy                string
+	Quota                bool
+	QuotaFile            string
+	QuotaReport          string
 	Shodan               goflags.StringSlice
 	ShodanIdb            goflags.StringSlice
 	Fofa                 goflags.StringSlice
@@ -114,6 +117,12 @@ func ParseOptions() *Options {
 		flagSet.IntVarP(&options.RateLimitMinute, "rate-limit-minute", "rlm", 0, "maximum number of requests to send per minute"),
 		flagSet.IntVar(&options.Retries, "retry", 2, "number of times to retry a failed request"),
 		flagSet.StringVar(&options.Proxy, "proxy", "", "http proxy to use with uncover"),
+	)
+
+	flagSet.CreateGroup("quota", "Quota",
+		flagSet.BoolVar(&options.Quota, "quota", false, "enable per-engine quota management and degradation"),
+		flagSet.StringVar(&options.QuotaFile, "quota-config", "", "engine quota configuration file (YAML); implies -quota"),
+		flagSet.StringVar(&options.QuotaReport, "quota-report", "", "write per-engine quota usage / skip report to this JSON file (implies -quota)"),
 	)
 
 	flagSet.CreateGroup("update", "Update",
@@ -212,6 +221,32 @@ func ParseOptions() *Options {
 	}
 
 	return options
+}
+
+// QuotaOptions holds the parsed and validated quota configuration. It returns
+// (nil, nil) when quota management was not requested, which keeps the legacy
+// code path untouched.
+func (options *Options) QuotaOptions() (*sources.QuotaConfig, error) {
+	enabled := options.Quota || options.QuotaFile != "" || options.QuotaReport != ""
+	if !enabled {
+		return nil, nil
+	}
+	cfg := &sources.QuotaConfig{}
+	if options.QuotaFile != "" {
+		loaded, err := sources.LoadQuotaConfigFile(options.QuotaFile)
+		if err != nil {
+			return nil, err
+		}
+		cfg = loaded
+	}
+	if err := cfg.ValidateForAgents(options.Engine); err != nil {
+		where := "quota configuration"
+		if options.QuotaFile != "" {
+			where = "quota configuration " + options.QuotaFile
+		}
+		return nil, fmt.Errorf("%s: %w", where, err)
+	}
+	return cfg, nil
 }
 
 // configureOutput configures the output on the screen

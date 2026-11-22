@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -28,11 +29,17 @@ func NewRunner(options *Options) (*Runner, error) {
 	runner := &Runner{options: options}
 	appendAllQueries(options)
 
+	quotaConfig, err := options.QuotaOptions()
+	if err != nil {
+		return nil, errorutil.New("invalid quota configuration: %s", err)
+	}
+
 	opts := uncover.Options{
 		Agents:  options.Engine,
 		Queries: options.Query,
 		Limit:   options.Limit,
 		Proxy:   options.Proxy,
+		Quota:   quotaConfig,
 	}
 	service, err := uncover.New(&opts)
 	if err != nil {
@@ -95,7 +102,62 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 		}
 	}
-	return r.service.ExecuteWithCallback(ctx, resultCallback)
+	err := r.service.ExecuteWithCallback(ctx, resultCallback)
+	r.logQuotaSummary()
+	r.writeQuotaReport()
+	return err
+}
+
+// logQuotaSummary prints a compact per-engine usage line when quota
+// management is enabled, so the run is self-describing even without a report
+// file. It is a no-op in legacy mode.
+func (r *Runner) logQuotaSummary() {
+	report := r.service.Report()
+	if report == nil {
+		return
+	}
+	for _, engine := range report.Engines {
+		remaining := "unlimited"
+		if engine.Remaining != nil {
+			remaining = fmt.Sprintf("%d", *engine.Remaining)
+		}
+		switch engine.Status {
+		case sources.StatusSkipped:
+			gologger.Warning().Msgf("engine %s: skipped (%s) used=%d remaining=%s\n", engine.Engine, engine.Reason, engine.CallsUsed, remaining)
+		case sources.StatusError:
+			gologger.Warning().Msgf("engine %s: error (%s) used=%d remaining=%s\n", engine.Engine, engine.Error, engine.CallsUsed, remaining)
+		default:
+			gologger.Info().Msgf("engine %s: participated used=%d remaining=%s\n", engine.Engine, engine.CallsUsed, remaining)
+		}
+		if engine.FailOpen {
+			gologger.Warning().Msgf("engine %s: quota accounting failed (%s); ran unlimited\n", engine.Engine, engine.FailOpenReason)
+		}
+	}
+}
+
+// writeQuotaReport persists the per-engine quota usage report when
+// -quota-report was set. Errors are logged but do not change the exit code,
+// because the report is diagnostic output, not a result.
+func (r *Runner) writeQuotaReport() {
+	path := r.options.QuotaReport
+	if path == "" {
+		return
+	}
+	report := r.service.Report()
+	if report == nil {
+		return
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		gologger.Error().Msgf("could not encode quota report: %s\n", err)
+		return
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		gologger.Error().Msgf("could not write quota report %s: %s\n", path, err)
+		return
+	}
+	gologger.Info().Msgf("quota report written to %s\n", path)
 }
 
 // Close closes its resources

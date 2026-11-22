@@ -46,6 +46,9 @@ type Options struct {
 	RateLimit     uint          // default 30 req
 	RateLimitUnit time.Duration // default unit
 	Proxy         string        // http proxy to use with uncover
+	// Quota enables per-engine quota management. Nil keeps the legacy
+	// behaviour: no budgets, no 429 backoff, no run report.
+	Quota *sources.QuotaConfig
 }
 
 // Service handler of all uncover Agents
@@ -55,6 +58,10 @@ type Service struct {
 	Session  *sources.Session
 	Provider *sources.Provider
 	Keys     sources.Keys
+	Quota    *sources.QuotaManager
+
+	reportMu sync.Mutex
+	report   *sources.RunReport
 }
 
 // New creates new uncover service instance
@@ -117,7 +124,11 @@ func New(opts *Options) (*Service, error) {
 	}
 
 	var err error
-	s.Session, err = sources.NewSession(&s.Keys, opts.MaxRetry, opts.Timeout, 10, opts.Agents, opts.RateLimitUnit, opts.Proxy)
+	s.Quota, err = sources.NewQuotaManager(opts.Quota, opts.Agents)
+	if err != nil {
+		return nil, errorutil.NewWithTag("uncover", "invalid quota configuration: %s", err)
+	}
+	s.Session, err = sources.NewSessionWithQuota(&s.Keys, opts.MaxRetry, opts.Timeout, 10, opts.Agents, opts.RateLimitUnit, opts.Proxy, s.Quota)
 	if err != nil {
 		return nil, err
 	}
@@ -136,15 +147,33 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 		return nil, errorutil.NewWithTag("uncover", "agents %v requires keys but no keys were found", s.Options.Agents)
 	}
 
+	run := newRunState(s.Quota, s.Options.Agents)
+	if s.Quota != nil {
+		// Counters are per-run; the remaining budget itself is preserved.
+		s.Quota.ResetRun()
+	}
+
 	megaChan := make(chan sources.Result, DefaultChannelBuffSize)
 	// iterate and run all sources
 	wg := &sync.WaitGroup{}
+	started := 0
 	for _, q := range s.Options.Queries {
 	agentLabel:
 		for _, agent := range s.Agents {
+			name := agent.Name()
 			keys := s.Provider.GetKeys()
-			if keys.Empty() && agent.Name() != "shodan-idb" && agent.Name() != "scanmalware" && agent.Name() != "subdomaincenter" {
-				gologger.Error().Msgf(agent.Name(), "agent given but keys not found")
+			if keys.Empty() && name != "shodan-idb" && name != "scanmalware" && name != "subdomaincenter" {
+				gologger.Error().Msgf(name, "agent given but keys not found")
+				run.markSkipped(name, sources.ReasonMissingKeys, "agent given but keys not found")
+				continue agentLabel
+			}
+			// Advisory check only: Acquire inside Session.Do is authoritative.
+			// This avoids starting an engine that is known to be out of budget
+			// and gives a clear skip reason even if the engine never calls Do.
+			if s.Quota != nil && !s.Quota.Available(name) {
+				reason, message := s.Quota.SkipReason(name)
+				gologger.Warning().Msgf("skipping engine %s: %s", name, message)
+				run.markSkipped(name, reason, message)
 				continue agentLabel
 			}
 			ch, err := agent.Query(ctx, s.Session, &sources.Query{
@@ -153,10 +182,13 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 			})
 			if err != nil {
 				gologger.Error().Msgf("%s\n", err)
+				run.markSkipped(name, classifyQueryError(err), err.Error())
 				continue agentLabel
 			}
+			run.markStarted(name)
+			started++
 			wg.Add(1)
-			go func(source, relay chan sources.Result, ctx context.Context) {
+			go func(engine string, source, relay chan sources.Result, ctx context.Context) {
 				defer wg.Done()
 				for {
 					select {
@@ -167,6 +199,11 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 						if !ok {
 							return
 						}
+						if res.Error != nil {
+							run.markError(engine, res.Error)
+						} else {
+							run.markProduced(engine)
+						}
 						select {
 						case <-ctx.Done():
 							return
@@ -174,14 +211,23 @@ func (s *Service) Execute(ctx context.Context) (<-chan sources.Result, error) {
 						}
 					}
 				}
-			}(ch, megaChan, ctx)
+			}(name, ch, megaChan, ctx)
 		}
+	}
+
+	// All requested engines were skipped before any request was made. This is
+	// an explicit failure, not an empty success. Gate on quota being enabled so
+	// the legacy path (for example a missing key) keeps its old exit behaviour.
+	if s.Quota != nil && started == 0 && len(run.skippedSnapshot()) > 0 {
+		s.setReport(run.report())
+		return nil, errorutil.NewWithTag("uncover", "all engines were skipped: %s", run.skipSummary())
 	}
 
 	// close channel when all sources return
 	go func(wg *sync.WaitGroup, megaChan chan sources.Result) {
 		wg.Wait()
-		defer close(megaChan)
+		s.setReport(run.report())
+		close(megaChan)
 	}(wg, megaChan)
 
 	return megaChan, nil

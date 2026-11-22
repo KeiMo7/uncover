@@ -112,6 +112,11 @@ CONFIG:
    -retry int                    number of times to retry a failed request (default 2)
    -proxy string                 http proxy to use with uncover
 
+QUOTA:
+   -quota                        enable per-engine quota management and degradation
+   -quota-config string          engine quota configuration file (YAML); implies -quota
+   -quota-report string          write per-engine quota usage / skip report to this JSON file (implies -quota)
+
 OUTPUT:
    -o, -output string  output file to write found results
    -f, -field string   field to display in output (ip,port,host) (default "ip:port")
@@ -129,6 +134,223 @@ DEBUG:
 ## Using uncover as library
 
 Example of using uncover as library is provided in [examples](examples/main.go) directory.
+
+Quota management is enabled by setting `Options.Quota`; leave it nil for the
+legacy behaviour.
+
+```go
+quota := &sources.QuotaConfig{
+    Engines: map[string]*sources.EngineQuota{
+        "shodan": {Limit: ptr(100)},
+        "fofa":   {Limit: ptr(500)},
+    },
+}
+u, err := uncover.New(&uncover.Options{
+    Agents:  []string{"shodan", "fofa"},
+    Queries: []string{"app=\"jira\""},
+    Limit:   100,
+    Quota:   quota,
+})
+// ...
+if report := u.Report(); report != nil {
+    for _, engine := range report.Skipped {
+        log.Printf("skipped %s: %s", engine.Engine, engine.Reason)
+    }
+}
+```
+
+## Per-engine quota management
+
+By default uncover behaves exactly as before: no budgets, no 429 backoff, no
+report. Enabling quota management is opt-in.
+
+```console
+# Enable with defaults (all engines unlimited, usage still reported)
+uncover -e shodan,fofa -q 'app="jira"' -quota
+
+# Enable with an explicit quota configuration and write a report
+uncover -e shodan,fofa,quake -q 'app="jira"' \
+  -quota-config quota.yaml -quota-report quota-report.json
+```
+
+When enabled:
+
+- Each engine has its own call budget. When one engine is out of budget it is
+  skipped with a warning while the others keep running.
+- HTTP `429` responses are retried with exponential backoff (honouring
+  `Retry-After`). A retry is **not** charged to the budget, so retries never
+  increase the total. After `max_retries` consecutive `429`s the engine is
+  marked `rate_limited` and skipped for the rest of the run.
+- The run report lists which engines participated and which were skipped, and
+  why (`quota_exhausted`, `rate_limited`, `missing_keys`, `query_error`), plus
+  per-engine `calls_used` / `remaining`.
+- If **every** engine is skipped, `Execute` returns an error naming each engine
+  and its reason. The CLI exits non-zero.
+- If quota accounting itself fails (a panic in the accounting path), the
+  affected engine degrades to unlimited for the rest of the run and a warning
+  is emitted; other engines are unaffected.
+
+### Quota configuration
+
+```yaml
+# Global defaults, overridden by defaults:/engines:.
+window:
+  type: fixed        # fixed | rolling
+  size: 24h
+max_retries: 2       # 429 retries before an engine is marked rate_limited
+backoff:
+  initial: 500ms
+  max: 30s
+
+# Applies to every engine, then engines.<name> overrides it.
+defaults:
+  limit: 1000
+  rate:
+    max: 1
+    per: 1s
+
+engines:
+  shodan:
+    limit: 100
+  fofa:
+    limit: 500
+    rate:
+      max: 2
+      per: 1s
+  quake:
+    unlimited: true   # overrides defaults.limit
+  netlas:
+    limit: 0          # always skipped: reported as quota_exhausted
+```
+
+Fields:
+
+| Field | Meaning |
+| --- | --- |
+| `limit` | Calls allowed per window. `0` skips the engine entirely. Omit (and do not set `defaults.limit`) to leave the engine unlimited. |
+| `unlimited` | Explicitly removes a `limit` inherited from `defaults`. Mutually exclusive with `limit`. |
+| `window.type` | `fixed` resets the whole counter at once; `rolling` releases each call exactly `size` after it was made. |
+| `window.size` | Window length (`24h`, `1m`, or a plain integer = seconds). |
+| `rate` | Per-engine request rate. Overrides the built-in per-engine default in `DefaultRateLimits`. |
+| `max_retries` | `429` retries before the engine is marked rate limited. |
+| `backoff` | Initial and maximum exponential backoff for `429`. |
+
+Engine-names in `engines:` are validated at startup. Unknown engines, negative
+limits, a `window.type` other than `fixed`/`rolling`, `limit` together with
+`unlimited`, or unknown keys are rejected with the exact offending key
+(for example `engines.shodan.window.type: must be "fixed" or "rolling"`).
+
+Engines with no quota entry at all are unlimited and are marked
+`unconfigured: true` in the report. This keeps shared config files usable
+across runs that request different engines.
+
+### Rolling windows
+
+With `window.type: rolling`, budget is computed from the timestamps of the
+calls made in the last `window.size`. A call made at `t` frees its slot at
+`t + size`; it is never assumed to be available before that, so unrecovered
+budget is not counted as usable. Example with `limit: 2`, `size: 1h`:
+
+| Time | Event | Slot in use | Available |
+| --- | --- | --- | --- |
+| 00:00 | call A | 1 | yes |
+| 00:30 | call B | 2 | yes |
+| 00:45 | call C | — | no (`quota_exhausted`) |
+| 01:00 | A ages out | 1 (B) | yes |
+| 01:30 | B ages out | 0 | yes |
+
+`remaining` in the report is computed against the same rolling set, so it never
+reports budget that has not actually been released yet.
+
+### Quota report
+
+`-quota-report` writes JSON shaped as (schema `uncover.quota-report/v1`):
+
+```json
+{
+  "schema": "uncover.quota-report/v1",
+  "enabled": true,
+  "engines": [
+    {"engine": "shodan", "status": "participated", "calls_used": 12,
+     "limit": 100, "remaining": 88, "window": "fixed"},
+    {"engine": "fofa", "status": "skipped", "reason": "quota_exhausted",
+     "calls_used": 50, "limit": 50, "remaining": 0, "window": "fixed"}
+  ],
+  "participated": ["shodan"],
+  "skipped": [{"engine": "fofa", "reason": "quota_exhausted"}]
+}
+```
+
+Known limits:
+
+- Budget is in-memory for one process; it is not persisted between runs. This is
+  also the compatibility boundary: there is no historical quota state to
+  migrate, and existing output/reports produced before this feature remain
+  valid. Use `-quota-report` output to seed or monitor external accounting if
+  you need cross-run budgets.
+- A `429` is detected from the HTTP status (or the Censys SDK response). An
+  engine that signals exhaustion through a non-`429` status or an in-body error
+  is not automatically converted to `quota_exhausted`; it is reported as
+  `query_error`. Set a matching `limit` to avoid over-calling such engines.
+- Quota mode disables the Censys SDK's internal retry loop so its calls are
+  accounted for; behaviour with quota disabled is unchanged.
+
+### Relationship to the existing rate limiter
+
+uncover already had a per-engine **rate** limiter (`sources.DefaultRateLimits`,
+`ratelimit.MultiLimiter`) that spaces requests over time and never refuses one.
+It does not model a finite budget: it cannot answer "how many calls are left
+today", and `Take` blocks forever rather than degrading. Quota management is a
+separate, additive layer:
+
+| | Rate limiter | Quota manager |
+| --- | --- | --- |
+| Question | "how fast?" | "how many in total?" |
+| On exhaustion | waits | skips the engine with a reason |
+| Scope | per duration | per window (fixed or rolling) |
+
+The two coexist: the rate limiter still runs first, and `quota.engines.<e>.rate`
+only overrides that engine's rate. Quota limits live in `-quota-config`, not in
+`DefaultRateLimits`, so the old behaviour is untouched when quota is off.
+
+### Cost
+
+Quota bookkeeping adds one mutex-protected map lookup plus one reservation per
+HTTP call; there is no additional copy of results and no new global
+synchronisation point. Measured on the same local upstream, 2000 calls each:
+
+| Path | ns/op | allocs/op |
+| --- | --- | --- |
+| quota disabled (`Session.Do`) | 653,573 | 140 |
+| quota enabled (`Session.Do`) | 660,661 | 141 |
+| `Acquire`+`Commit` alone | 82 | 1 |
+
+The call path is dominated by the HTTP round trip, so the difference is within
+run-to-run noise (~1%). Engines run concurrently as before; the only new lock
+is the per-engine budget mutex, which is independent per engine.
+
+### Concurrency and failure determinism
+
+- Reservations are atomic: concurrent calls never exceed `limit`. A test fires
+  200 goroutines against a limit of 10 and asserts exactly 10 acquisitions.
+- When an engine is skipped or a call fails (upstream disconnect, malformed
+  response), the reservation is released in a `defer`-style path, so the budget
+  cannot leak; a test asserts the unit is reusable after a connection error.
+- If the upstream disconnects mid-call, `Session.Do` returns an error and the
+  engine is reported as `query_error`; other engines and the budget totals stay
+  deterministic.
+- A malformed 200 response is surfaced by the agent as a result error, which is
+  also classified as `query_error`; it does not silently consume extra budget
+  beyond the one call actually made.
+
+### Example report
+
+[`docs/examples/quota/multi-engine-report.json`](docs/examples/quota/multi-engine-report.json)
+is a real output of a four-engine run: `censys` hit its `limit: 2` and is
+`partial` with `reason: quota_exhausted`; `odin` failed upstream and is
+`skipped` with `reason: query_error`; `shodan` and `fofa` participated. The
+`skipped` array at the bottom is the quick answer to "which engine was missing,
+and why".
 
 ## Provider Configuration
 
@@ -489,6 +711,9 @@ https://129.206.117.248
 - results are limited to `100` as default and can be increased with `limit` flag.
 - `shodan-idb` API doesn't requires an API key and works out of the box.
 - `shodan-idb` API is used as **default** engine when **IP/CIDR** is provided as input.
+- per-engine quota management is **off by default**; enabling it with
+  `-quota` / `-quota-config` adds budgets, `429` backoff and the usage report.
+  When disabled, query flags, output and exit codes are unchanged.
 
 -----
 

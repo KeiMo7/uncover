@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -44,9 +45,21 @@ type Session struct {
 	Client     *retryablehttp.Client
 	RetryMax   int
 	RateLimits *ratelimit.MultiLimiter
+	// Quota is optional. When set, every engine call is charged to the
+	// engine budget and 429 responses are retried with backoff.
+	Quota *QuotaManager
 }
 
+// NewSession builds a session. It is kept for backwards compatibility; quota
+// support is wired by NewSessionWithQuota.
 func NewSession(keys *Keys, retryMax, timeout, rateLimit int, engines []string, duration time.Duration, proxy string) (*Session, error) {
+	return NewSessionWithQuota(keys, retryMax, timeout, rateLimit, engines, duration, proxy, nil)
+}
+
+// NewSessionWithQuota builds a session and applies per-engine quota and rate
+// overrides. quota may be nil, in which case behaviour is identical to
+// NewSession.
+func NewSessionWithQuota(keys *Keys, retryMax, timeout, rateLimit int, engines []string, duration time.Duration, proxy string, quota *QuotaManager) (*Session, error) {
 	Transport := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -77,6 +90,7 @@ func NewSession(keys *Keys, retryMax, timeout, rateLimit int, engines []string, 
 		Client:   client,
 		Keys:     keys,
 		RetryMax: retryMax,
+		Quota:    quota,
 	}
 
 	var defaultRatelimit *ratelimit.Options
@@ -94,12 +108,27 @@ func NewSession(keys *Keys, retryMax, timeout, rateLimit int, engines []string, 
 	}
 
 	// setup ratelimit of all engines
+	rateOverrides := quota.RateLimitOverrides(engines)
 	for _, engine := range engines {
 		rateLimitOpts := DefaultRateLimits[engine]
 		if rateLimitOpts == nil {
 			// fallback to using default ratelimit
 			rateLimitOpts = defaultRatelimit
 			rateLimitOpts.Key = engine
+		}
+		if override, ok := rateOverrides[engine]; ok {
+			// Copy before mutating: DefaultRateLimits entries are shared.
+			optCopy := *rateLimitOpts
+			optCopy.Key = engine
+			switch {
+			case override.Unlimited:
+				optCopy.IsUnlimited = true
+			default:
+				optCopy.IsUnlimited = false
+				optCopy.MaxCount = override.Max
+				optCopy.Duration = override.Per
+			}
+			rateLimitOpts = &optCopy
 		}
 		if err = session.RateLimits.Add(rateLimitOpts); err != nil {
 			return nil, errorutil.NewWithErr(err).Msgf("failed to setup ratelimit of %v got %v", engine, err)
@@ -110,8 +139,10 @@ func NewSession(keys *Keys, retryMax, timeout, rateLimit int, engines []string, 
 }
 
 func (s *Session) Do(request *retryablehttp.Request, source string) (*http.Response, error) {
-	err := s.RateLimits.Take(source)
-	if err != nil {
+	if s.Quota != nil {
+		return s.doWithQuota(request, source)
+	}
+	if err := s.RateLimits.Take(source); err != nil {
 		return nil, err
 	}
 	// close request connection (does not reuse connections)
@@ -125,4 +156,86 @@ func (s *Session) Do(request *retryablehttp.Request, source string) (*http.Respo
 		return resp, fmt.Errorf("unexpected status code %d received from %s", resp.StatusCode, requestURL)
 	}
 	return resp, nil
+}
+
+// doWithQuota is the quota-enabled path. One unit of budget is charged per
+// successful engine call; 429 retries and failed calls release their
+// reservation, so retries never inflate the total. After `max_retries` 429s
+// the engine is marked rate-limited for the rest of the run and the error is
+// surfaced to the caller, which skips that engine only.
+func (s *Session) doWithQuota(request *retryablehttp.Request, source string) (*http.Response, error) {
+	// Take the rate limiter first so an exhausted engine does not burn budget
+	// waiting on a token.
+	if err := s.RateLimits.Take(source); err != nil {
+		return nil, err
+	}
+	request.Close = true
+
+	maxRetries := s.Quota.RateLimitRetries(source)
+	for attempt := 0; ; attempt++ {
+		token, err := s.Quota.Acquire(source)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := s.Client.Do(request)
+		if err != nil {
+			s.Quota.Release(token)
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			s.Quota.MarkRateLimited(source)
+			if attempt < maxRetries {
+				wait := retryAfter(resp)
+				if wait <= 0 {
+					wait = s.Quota.Backoff(source, attempt)
+				}
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				_ = resp.Body.Close()
+				s.Quota.Release(token)
+				if !sleepWithContext(request.Context(), wait) {
+					return nil, request.Context().Err()
+				}
+				if err := s.RateLimits.Take(source); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			// Retries exhausted: do not charge budget for a rejected call, and
+			// stop this engine for the remainder of the run.
+			_ = resp.Body.Close()
+			s.Quota.Release(token)
+			s.Quota.MarkRateExhausted(source)
+			return nil, fmt.Errorf("%w: %s answered 429 after %d retries", ErrRateLimitedExhausted, source, maxRetries)
+		}
+		if resp.StatusCode != http.StatusOK {
+			// The upstream answered but the call did not succeed. Return the
+			// reservation so an abnormal reply cannot consume budget.
+			s.Quota.Release(token)
+			requestURL, _ := url.QueryUnescape(request.String())
+			return resp, fmt.Errorf("unexpected status code %d received from %s", resp.StatusCode, requestURL)
+		}
+		s.Quota.Commit(token)
+		return resp, nil
+	}
+}
+
+func retryAfter(resp *http.Response) time.Duration {
+	if resp == nil {
+		return 0
+	}
+	return RetryAfterDuration(resp.Header.Get("Retry-After"))
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

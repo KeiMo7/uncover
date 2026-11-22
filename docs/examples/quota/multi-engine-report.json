@@ -1,0 +1,62 @@
+{
+  "schema": "uncover.quota-report/v1",
+  "enabled": true,
+  "generated_at": "2026-11-22T00:20:48Z",
+  "engines": [
+    {
+      "engine": "censys",
+      "status": "partial",
+      "reason": "quota_exhausted",
+      "error": "engine quota exhausted: censys has used 2/2 calls in the current window",
+      "calls_used": 2,
+      "calls_attempted": 3,
+      "limit": 2,
+      "remaining": 0,
+      "window": "fixed",
+      "quota_exhausted": true
+    },
+    {
+      "engine": "fofa",
+      "status": "participated",
+      "calls_used": 2,
+      "calls_attempted": 2,
+      "limit": null,
+      "remaining": null,
+      "window": "fixed",
+      "unconfigured": true
+    },
+    {
+      "engine": "odin",
+      "status": "skipped",
+      "reason": "query_error",
+      "error": "upstream returned malformed JSON",
+      "calls_used": 0,
+      "calls_attempted": 0,
+      "limit": null,
+      "remaining": null,
+      "window": "fixed",
+      "unconfigured": true
+    },
+    {
+      "engine": "shodan",
+      "status": "participated",
+      "calls_used": 3,
+      "calls_attempted": 3,
+      "limit": 100,
+      "remaining": 97,
+      "window": "fixed"
+    }
+  ],
+  "participated": [
+    "censys",
+    "fofa",
+    "shodan"
+  ],
+  "skipped": [
+    {
+      "engine": "odin",
+      "reason": "query_error",
+      "error": "upstream returned malformed JSON"
+    }
+  ]
+}

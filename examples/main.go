@@ -16,6 +16,13 @@ func main() {
 		Limit:    50,
 		MaxRetry: 2,
 		Timeout:  20,
+		// Optional: enable per-engine quotas. Leave this nil for the legacy
+		// behaviour.
+		Quota: &sources.QuotaConfig{
+			Engines: map[string]*sources.EngineQuota{
+				"shodan": {Limit: intPtr(100)},
+			},
+		},
 	}
 
 	u, err := uncover.New(&opts)
@@ -41,4 +48,14 @@ func main() {
 	if err := u.ExecuteWithCallback(context.TODO(), result); err != nil {
 		panic(err)
 	}
+
+	// With quota enabled, Report() describes participation and skips.
+	if report := u.Report(); report != nil {
+		for _, engine := range report.Engines {
+			fmt.Printf("engine %s: status=%s used=%d remaining=%v\n",
+				engine.Engine, engine.Status, engine.CallsUsed, engine.Remaining)
+		}
+	}
 }
+
+func intPtr(v int) *int { return &v }

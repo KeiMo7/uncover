@@ -137,5 +137,55 @@ func (agent *Agent) queryURL(ctx context.Context, session *sources.Session, URL 
 		return nil, err
 	}
 	request.Close = true
-	return session.Client.Do(request)
+	if session.Quota == nil {
+		return session.Client.Do(request)
+	}
+	// Quota mode: charge the call and treat 429 like every other engine. 202
+	// handling stays here because it is nerdydata-specific.
+	maxRetries := session.Quota.RateLimitRetries(agent.Name())
+	for attempt := 0; ; attempt++ {
+		reserved, err := session.Quota.Acquire(agent.Name())
+		if err != nil {
+			return nil, err
+		}
+		resp, err := session.Client.Do(request)
+		if err != nil {
+			session.Quota.Release(reserved)
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests {
+			session.Quota.MarkRateLimited(agent.Name())
+			if attempt < maxRetries {
+				wait := sources.RetryAfterDuration(resp.Header.Get("Retry-After"))
+				if wait <= 0 {
+					wait = session.Quota.Backoff(agent.Name(), attempt)
+				}
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				_ = resp.Body.Close()
+				session.Quota.Release(reserved)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(wait):
+				}
+				if err := session.RateLimits.Take(agent.Name()); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			_ = resp.Body.Close()
+			session.Quota.Release(reserved)
+			session.Quota.MarkRateExhausted(agent.Name())
+			return nil, fmt.Errorf("%w: %s answered 429 after %d retries", sources.ErrRateLimitedExhausted, agent.Name(), maxRetries)
+		}
+		if resp.StatusCode == http.StatusOK {
+			session.Quota.Commit(reserved)
+			return resp, nil
+		}
+		// 202 (server-side timeout, caller retries) and other non-200 replies
+		// produced no result; return the reservation so retries do not inflate
+		// the total.
+		session.Quota.Release(reserved)
+		return resp, nil
+	}
 }
