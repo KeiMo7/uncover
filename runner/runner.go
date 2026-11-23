@@ -8,6 +8,8 @@ import (
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/uncover"
+	"github.com/projectdiscovery/uncover/querylang"
+	"github.com/projectdiscovery/uncover/querylang/backends"
 	"github.com/projectdiscovery/uncover/sources"
 	errorutil "github.com/projectdiscovery/utils/errors"
 	stringsutil "github.com/projectdiscovery/utils/strings"
@@ -29,10 +31,12 @@ func NewRunner(options *Options) (*Runner, error) {
 	appendAllQueries(options)
 
 	opts := uncover.Options{
-		Agents:  options.Engine,
-		Queries: options.Query,
-		Limit:   options.Limit,
-		Proxy:   options.Proxy,
+		Agents:       options.Engine,
+		Queries:      options.Query,
+		Limit:        options.Limit,
+		Proxy:        options.Proxy,
+		Unified:      options.UnifiedQuery,
+		AllowDegrade: options.AllowDegrade,
 	}
 	service, err := uncover.New(&opts)
 	if err != nil {
@@ -61,6 +65,22 @@ func NewRunner(options *Options) (*Runner, error) {
 // RunEnumeration runs the subdomain enumeration flow on the targets specified
 func (r *Runner) Run(ctx context.Context) error {
 	resultCallback := func(result sources.Result) {
+		// Unified-mode non-asset stream entries: never print them as assets.
+		// Errors stay warnings; diagnostics go to the log so the asset
+		// output format and fields remain exactly compatible.
+		if result.Status != sources.StatusAsset {
+			switch result.Status {
+			case sources.StatusEngineError, sources.StatusCompileRejected:
+				gologger.Warning().Label(result.Source).Msgf("%s\n", result.Message)
+			case sources.StatusEmpty:
+				gologger.Info().Label(result.Source).Msgf("empty result set (query compiled and accepted): %s\n", result.EffectiveQuery)
+			case sources.StatusDegraded:
+				gologger.Warning().Label(result.Source).Msgf("degraded query: %s\n", strings.Join(result.DroppedConditions, "; "))
+			case sources.ResultStatus("coverage"):
+				gologger.Info().Label("coverage").Msgf("%s\n", result.Message)
+			}
+			return
+		}
 		optionFields := r.options.OutputFields
 		switch {
 		case result.Error != nil:
@@ -103,4 +123,36 @@ func (r *Runner) Close() {
 	if r.outputWriter != nil {
 		r.outputWriter.Close()
 	}
+}
+
+// Explain compiles every query for the selected (or all) engines and prints
+// the cross-engine equivalence report without making any network call. It
+// returns an error when a query cannot be parsed, so the position-bearing
+// parse error is surfaced instead of a vague failure.
+func (r *Runner) Explain() error {
+	mode := querylang.DegradeReject
+	if r.options.AllowDegrade {
+		mode = querylang.DegradeTopLevelAND
+	}
+	var compiler *querylang.Compiler
+	if len(r.options.Engine) > 0 {
+		compiler = backends.CompilerForEngines(mode, r.options.Engine)
+	} else {
+		compiler = backends.DefaultCompiler(mode)
+	}
+
+	var report strings.Builder
+	for _, q := range r.options.Query {
+		tree, err := querylang.Parse(q)
+		if err != nil {
+			return errorutil.NewWithTag("uncover", "query %q: %v", q, err)
+		}
+		compiled, errs := compiler.CompileAll(tree)
+		report.WriteString(fmt.Sprintf("unified query: %s\n", q))
+		report.WriteString(fmt.Sprintf("syntax version: %s\n\n", querylang.SyntaxVersion))
+		report.WriteString(querylang.Explain(compiled, errs))
+		report.WriteString("\n")
+	}
+	fmt.Fprintln(os.Stdout, report.String())
+	return nil
 }

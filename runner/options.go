@@ -68,6 +68,17 @@ type Options struct {
 	ScanMalware          goflags.StringSlice
 	SubdomainCenter      goflags.StringSlice
 	DisableUpdateCheck   bool
+	// UnifiedQuery enables the unified query language pipeline (parse ->
+	// compile per engine) instead of raw query passthrough. Default off so
+	// existing configurations keep their exact behavior.
+	UnifiedQuery bool
+	// AllowDegrade permits dropping unsupported top-level AND conjuncts
+	// with an explicit report instead of rejecting the engine compile.
+	AllowDegrade bool
+	// ExplainQuery compiles each -uq query for every engine and prints the
+	// equivalence report (native query, effective conditions, alternatives,
+	// rejections) without sending any network request.
+	ExplainQuery bool
 }
 
 // ParseOptions parses the command line flags provided by a user
@@ -104,6 +115,12 @@ func ParseOptions() *Options {
 		flagSet.StringSliceVarP(&options.NerdyData, "nerdydata", "nd", nil, "search query for NerdyData (example: -nerdydata 'query.txt')", goflags.FileStringSliceOptions),
 		flagSet.StringSliceVarP(&options.ScanMalware, "scanmalware", "sm", nil, "search query for scanmalware (example: -scanmalware 'query.txt')", goflags.FileStringSliceOptions),
 		flagSet.StringSliceVarP(&options.SubdomainCenter, "subdomaincenter", "sc", nil, "search query for subdomaincenter (example: -subdomaincenter 'query.txt')", goflags.FileStringSliceOptions),
+	)
+
+	flagSet.CreateGroup("unified-query", "Unified-Query",
+		flagSet.BoolVarP(&options.UnifiedQuery, "unified-query", "uq", false, "parse queries in the unified query language and compile them per engine instead of forwarding the raw string"),
+		flagSet.BoolVarP(&options.AllowDegrade, "allow-degrade", "ad", false, "with -uq: allow an engine to drop an unsupported top-level AND condition (every drop is reported) instead of rejecting the query"),
+		flagSet.BoolVarP(&options.ExplainQuery, "explain-query", "eq", false, "with -uq: print how each query compiles on every engine (native query, effective conditions, rejections) and exit without network calls"),
 	)
 
 	flagSet.CreateGroup("config", "Config",

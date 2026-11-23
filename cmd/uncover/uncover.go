@@ -18,6 +18,14 @@ func main() {
 		gologger.Fatal().Msgf("Could not create runner: %s\n", err)
 	}
 
+	if options.ExplainQuery {
+		if err := newRunner.Explain(); err != nil {
+			gologger.Fatal().Msgf("%s\n", err)
+		}
+		newRunner.Close()
+		return
+	}
+
 	err = newRunner.Run(context.Background())
 	if err != nil {
 		gologger.Fatal().Msgf("Could not run enumeration: %s\n", err)

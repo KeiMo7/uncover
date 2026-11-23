@@ -2,9 +2,28 @@ package sources
 
 import "context"
 
+// Query is the unit of work handed to an Agent.
 type Query struct {
+	// Query is the native query string the agent sends to its upstream API.
+	// In raw passthrough mode it is the user's text unchanged. In unified
+	// query mode it is the per-engine output of the querylang compiler.
 	Query string
 	Limit int
+	// Unified is the original unified-syntax text when compilation was used,
+	// empty in raw passthrough mode.
+	Unified string
+	// EffectiveConditions are the canonical conditions that actually
+	// constrain Query (all parsed conditions minus explicitly degraded ones).
+	// Empty in raw passthrough mode.
+	EffectiveConditions []string
+	// Degraded reports whether one or more conditions were dropped for this
+	// engine; DroppedConditions describes each omission.
+	Degraded bool
+	// DroppedConditions lists human-readable descriptions of conditions
+	// omitted under an explicit degradation policy.
+	DroppedConditions []string
+	// SyntaxVersion records the grammar version the query was compiled under.
+	SyntaxVersion string
 }
 
 // Agent fans out a query to one upstream search engine and streams results
